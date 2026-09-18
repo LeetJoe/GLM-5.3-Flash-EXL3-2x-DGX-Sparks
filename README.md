@@ -19,6 +19,11 @@ A **3×** sibling is `./start-tp3.sh` on the same image and weights (see
 [3× Spark (TP=3)](#3x-spark-tp3)). Served model id: **`GLM-5.3-Flash-EXL3`**. EXL3/TR3 quant by
 [brandonmusic](https://huggingface.co/brandonmusic).
 
+Optional TP3 contribution for evaluation: [cooperative ABI2, 64-row support,
+FlashKDA and combined-profile measurements](docs/tp3-throughput-results.md).
+Historical measurements and pending validation of the upstream-based branch
+are documented separately; existing defaults are unchanged.
+
 This is **EXL3 weights + fp8 KV** on GB10. Do not pass `--moe-backend marlin`.
 The Hub card on brandonmusic (TP2/EP2/DCP2 + calibrated NVFP4 MLA KV) is the SM120 B12X
 image (`verdictai/glm53-flash-exl3-k4:…-v84-dflash2`), not this overlay. Target KV
@@ -26,6 +31,9 @@ stays packed **`fp8_ds_mla`**. Speculator is **DFlash2 k=7**
 ([incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2));
 draft attention is **FLASH_ATTN** (do not pin `TRITON_ATTN` — that mask is causal
 inside the draft block on this image and collapses later-position accept).
+
+Release notes from the initial 1.0.0 recipe through **1.6.0** are in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Cold prefill (E3 grouped MoE, this kit, 2026-09-07)
 
@@ -88,14 +96,20 @@ Official numbers: sparkDash Decode bench, DFlash2 k=7, **Structured** (count 1�
 
 That 2026-08-28 decode serve used `--max-model-len 1000000` with a **1,754,237-token** KV pool. These runs are warm / empty KV — they do not need a filled 1M cache.
 
-**Prose** (sparkDash Decode bench, prose prompt type, 2026-09-08) on the adaptive-verification + FP8-dense serve
-(`GLM53_ADAPTIVE_K=ema`, `GLM53_DENSE_FP8=dense,kda`, 850k context, KV pool capped at 14 GiB — turned on
-as below; the stock k=7 / BF16 serve measured ~18–27 tok/s per stream on the lab prose prompts):
+**Prose** (sparkDash Decode bench, prose prompt type, 2026-09-17, thinking
+**off**) on this 2× kit (`GLM53_ADAPTIVE_K=ema`, `GLM53_DENSE_FP8=dense,kda`,
+cooperative MoE overlay, 850k context, KV pool capped at 14 GiB). Stream is
+per request; aggregate is all streams.
 
 | Concurrency | TTFT | Stream tok/s | Aggregate tok/s |
 |---|---:|---:|---:|
-| **×1** | **268 ms** | **32.1** | **32.1** |
-| **×2** | 399 ms | 22.1 | 41.2 |
+| **×1** | **333 ms** | **36.1** | **37.1** |
+| **×2** | 365 ms | 25.0 | 51.1 |
+| **×3** | 405 ms | 22.3 | 65.8 |
+| **×4** | 401 ms | 19.4 | 75.3 |
+
+The 2026-09-08 adaptive-k + dense-FP8 table (no coop overlay in that write-up)
+was ×1 **32.1** / ×2 **22.1** stream (**41.2** agg), TTFT 268 / 399 ms.
 
 ### Opt-in cooperative decode MoE
 
@@ -107,7 +121,7 @@ and `overlay/exl3.py` stay stock until you select a generated overlay with
 `EXL3_OVERLAY_HOST`.
 
 Do not load the DS4.1 cooperative `.so` here. Serving measurements vs the
-tables above (prose ×1/×2 32.1 / 41.2 agg, structured ×1 62.9) are recorded
+tables above (prose ×1 **37.1** / ×2 **51.1** agg, structured ×1 62.9) are recorded
 after the GPU gate in [`docs/cooperative-moe.md`](docs/cooperative-moe.md).
 Live operator handoff (geometry 1, rollback, pins):
 [`docs/cooperative-moe-handoff.md`](docs/cooperative-moe-handoff.md).
@@ -593,8 +607,9 @@ took 112.49 s instead of 14.70 s, and a branch at 90% took 99.89 s instead of
 111,104. All tested answers were correct. These are sequential histories,
 not four simultaneously active 210K streams.
 
-The global launcher spelling is `GLM53_APC_RETENTION_INTERVAL` (TP=2 only).
-Leave it unset for normal use; TP=4 rejects either retention override.
+The global launcher spelling is `GLM53_APC_RETENTION_INTERVAL` (leave unset
+for a dense MLA/mamba grid). `start.sh`, `start-tp3.sh`, and `start-tp4.sh`
+all forward `GLM53_APC_RETENTION_INTERVAL_SWA`.
 
 Both retention knobs remain unset by default. Keep that default unless the
 tradeoff fits the workload. SWA-only sparse retention with a dense target is
@@ -820,11 +835,21 @@ reordering `NCCL_IB_HCA` does not help (NCCL enumerates devices in system
 order). Put the control plane on the management LAN (`SOCKET_IFNAME`); keep
 data on RoCE via `NCCL_IB_HCA`.
 
-Decode on this kit (2026-09-14, temp 0, thinking off, 400 tok, median of 3;
-count / hashmap / LRU-code): structured **87.8**, code **54.9**, prose **39.6**,
-TTFT **0.25 s**. Same prompts, TP=2: 73.4 / 45.0 / 32.9 / 0.33 s. jspark3's
-3× stack is still ahead on structured (~95 tok/s) — `DFLASH_DRAFT_TP=1` is the
-divisibility tax.
+**Prose** (sparkDash Decode bench, 2026-09-17, thinking **off**, 512 tok,
+1–4 concurrent) on this 3× kit:
+
+| Concurrency | TTFT | Stream tok/s | Aggregate tok/s |
+|---|---:|---:|---:|
+| **×1** | **255 ms** | **40.1** | **40.1** |
+| **×2** | 411 ms | 28.7 | 56.6 |
+| **×3** | 323 ms | 25.5 | 75.5 |
+| **×4** | 351 ms | 22.8 | 88.4 |
+
+Earlier lab medians on this kit (2026-09-14, temp 0, thinking off, 400 tok,
+median of 3; count / hashmap / LRU-code): structured **87.8**, code **54.9**,
+prose **39.6**, TTFT **0.25 s**. Same prompts, TP=2: 73.4 / 45.0 / 32.9 / 0.33 s.
+jspark3's 3× stack is still ahead on structured (~95 tok/s) —
+`DFLASH_DRAFT_TP=1` is the divisibility tax.
 
 Shape overlays and the two EP loader traps: [`overlay/tp3/README.md`](overlay/tp3/README.md).
 The flags and overlays come from
@@ -1031,7 +1056,7 @@ that are now documented/enforced:
 | `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` when unset | TP=2 `start.sh` passes the effective value to both ranks. An explicit empty value disables this option; caller exports, including empty, override `.env`. Changing allocator settings requires a restart and separate memory/connector qualification; TP=4 is unchanged |
 | `KV_CACHE_DTYPE` | `fp8` | packed `fp8_ds_mla`; not `nvfp4`, not bf16 |
 | `DEFAULT_MAX_NEW_TOKENS` | `65536` | Omitted-only output-token default (`1..1000000`) for chat and completion requests, implemented by `overlay/patch_default_max_new_tokens.py`. Explicit `max_tokens`/`max_completion_tokens` overrides this default; independent server, platform and remaining-context caps still apply. Empty preserves stock model/server defaults and caps. Does not reserve admission capacity or fix long-prefill contention; admission is chunk-based. Caller exports (including empty) override `.env`. TP=2 launcher only; `start-tp4.sh` is unchanged. |
-| `GLM53_APC_RETENTION_INTERVAL_SWA` | *(unset)* | TP=2 DFlash2 drafter retention. Empty inherits global retention with ordinary priority; explicit `0` keeps reachable boundaries and enables draft-only eviction priority; positive values must be multiples of 3584, at most 1,000,000. Requires `SPEC_METHOD=dflash` and the hybrid prefix overlay. TP=4 rejects a non-empty value. Qualify retention, branching, and draft acceptance for the chosen global/SWA pair; see [measurements](docs/apc-retention-qualification.md) |
+| `GLM53_APC_RETENTION_INTERVAL_SWA` | *(unset)* | DFlash2 drafter retention on TP=2/3/4. Empty inherits global retention with ordinary priority; explicit `0` keeps reachable boundaries and enables draft-only eviction priority; positive values must be multiples of 3584, at most 1,000,000. Requires `SPEC_METHOD=dflash` and the hybrid prefix overlay. Qualify retention, branching, and draft acceptance for the chosen global/SWA pair; see [measurements](docs/apc-retention-qualification.md) |
 | `GLM53_APC_NO_STORE` | `1` | honour a client's per-request GPU prefix-cache **no-store** flag (overlay `patch_apc_no_store.py`; see [Opting a request out of the prefix cache](#opting-a-request-out-of-the-prefix-cache)). Requests never opt in on their own, so `1` changes nothing until a client sends the flag. `0` = ignore the flag (logged once); malformed values are rejected either way. Exactly `0` or `1`; the launcher refuses anything else before `restart` stops the pair |
 | `GLM53_KV_CAPACITY_LOG` | `1` | after vLLM's `GPU KV cache size: N tokens` boot line (N = max_concurrency × max_model_len, **not** a pool size) log one line per KV-cache group and a summary with the usable block ids, the ids one aligned cached segment costs across groups and the resulting cached-conversation capacity (overlay `patch_kv_capacity_log.py`; see [What the KV cache boot line means](#what-the-kv-cache-boot-line-means)). `0` = off (one line saying so). Log-only, no serving change either way. Exactly `0` or `1`; the launcher refuses anything else before `restart` stops the pair |
 | `GLM53_MIXED_PREFILL_CHUNK` | `fair` (`start.sh`, `start-tp3.sh`, `start-tp4.sh`, `.env.example`, `.env.tp3.example`, `.env.tp4.example`) | Mixed-prefill policy while a peer decodes. **`skip` starves prefills until decode ends** (the reported multi-minute newcomer freeze). `N>0` caps mixed chunks with hybrid alignment support; `0`/`off` disables isolation (admits newcomers in ~1 s but collapses the incumbent 10–36× on TP=2). `fair` v5 allocates decodes first, charges only prefill that contends with a decoder, fits a fixed-plus-per-token step cost, runs the largest chunk that fits `GLM53_FAIR_PREFILL_MAX_STEP_MS`, and gives a newcomer one prompt probe. Measured on TP=2 (reporter recipe, thinking essay at ~24 tok/s): 2k newcomer first token ~12 s, 30k newcomer ~164 s while the essay still streams, incumbent keeps ~80–90% of its in-run rate. TP=3 same recipe: 2k in 8.7 s, 30k in 110 s, both during the essay, incumbent ~83–87%. TP=4 inherits the same default; that topology was not re-measured. See [receipts](docs/diditfix.md) and [design](docs/astra-fix.md). |
