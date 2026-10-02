@@ -9,8 +9,16 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# start.sh clears these right after sourcing .env, so a `.env` value does NOT
+# reach the launcher when the caller stays silent. Only ABLIT is cleared today:
+# the abliterated preset ships pre-edited o_proj weights, so a stale
+# `.env` ABLIT=1 must not silently edit them again.
+DOTENV_CLEARED_KEYS = {"ABLIT"}
 
 
 def test_max_num_seqs_inline_override_wins() -> None:
@@ -42,7 +50,9 @@ def test_max_num_seqs_inline_override_wins() -> None:
     assert result.stdout.strip() == "MAX_NUM_SEQS=4"
 
 
-def _run_preamble(env_file: str, caller: dict[str, str], probe: str) -> str:
+def _run_preamble_proc(
+    env_file: str, caller: dict[str, str], probe: str
+) -> subprocess.CompletedProcess[str]:
     """Run start.sh's pre-configuration preamble with a synthetic .env."""
     source = (ROOT / "start.sh").read_text()
     marker = "# ----------------------------- configuration -------------------------------"
@@ -58,10 +68,14 @@ def _run_preamble(env_file: str, caller: dict[str, str], probe: str) -> str:
 
         env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp), "USER": "glm53"}
         env.update(caller)
-        result = subprocess.run(
+        return subprocess.run(
             ["bash", str(script)], check=True, capture_output=True, text=True, env=env
         )
-    return result.stdout.strip()
+
+
+def _run_preamble(env_file: str, caller: dict[str, str], probe: str) -> str:
+    """Stdout of the preamble run, stripped."""
+    return _run_preamble_proc(env_file, caller, probe).stdout.strip()
 
 
 def test_default_reasoning_effort_caller_override_is_setness_aware() -> None:
@@ -86,6 +100,42 @@ def test_default_reasoning_effort_caller_override_is_setness_aware() -> None:
     assert _run_preamble(
         env_file, {"GLM53_DEFAULT_REASONING_EFFORT": ""}, probe
     ) == "EFFORT=[]"
+
+
+@pytest.mark.parametrize("launcher,topology_env", [("start-tp3.sh", ".env.tp3"),
+                                                    ("start-tp4.sh", ".env.tp4")])
+def test_default_reasoning_effort_precedence_on_tp3_tp4(launcher: str, topology_env: str) -> None:
+    """caller export > .env.tpX > shared .env, setness-aware, as on start.sh.
+
+    A .env copied from .env.example always carries the knob (empty), so a
+    launcher that does not capture the caller loses its export silently."""
+    source = (ROOT / launcher).read_text()
+    marker = "# ----------------------------- configuration -------------------------------"
+    preamble, separator, _rest = source.partition(marker)
+    assert separator, f"{launcher} configuration marker is missing"
+    probe = '\nprintf "EFFORT=[%s]\\n" "${GLM53_DEFAULT_REASONING_EFFORT-unset}"\n'
+
+    def run(shared: str, topology: str, caller: dict[str, str]) -> str:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            script = tmp / launcher
+            script.write_text(preamble + probe)
+            (tmp / ".env").write_text(shared)
+            (tmp / topology_env).write_text(topology)
+            env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp), "USER": "glm53", **caller}
+            return subprocess.run(["bash", str(script)], check=True, capture_output=True,
+                                  text=True, env=env).stdout.strip().splitlines()[-1]
+
+    example_line = "GLM53_DEFAULT_REASONING_EFFORT=\n"  # as shipped in .env.example
+    assert run(example_line, "", {}) == "EFFORT=[]"
+    assert run("GLM53_DEFAULT_REASONING_EFFORT=high\n", "", {}) == "EFFORT=[high]"
+    assert run("GLM53_DEFAULT_REASONING_EFFORT=high\n",
+               "GLM53_DEFAULT_REASONING_EFFORT=max\n", {}) == "EFFORT=[max]"
+    effort = "GLM53_DEFAULT_REASONING_EFFORT"
+    assert run(example_line, "", {effort: "low"}) == "EFFORT=[low]"
+    assert run("GLM53_DEFAULT_REASONING_EFFORT=high\n",
+               "GLM53_DEFAULT_REASONING_EFFORT=max\n", {effort: "low"}) == "EFFORT=[low]"
+    assert run("GLM53_DEFAULT_REASONING_EFFORT=high\n", "", {effort: ""}) == "EFFORT=[]"
 
 
 def test_indexer_workspace_caller_capture_is_setness_aware() -> None:
@@ -133,6 +183,9 @@ def test_every_env_example_key_preserves_caller_setness() -> None:
     keys = re.findall(
         r"^(?:# )?([A-Za-z_][A-Za-z0-9_]*)=", (ROOT / ".env.example").read_text(), re.M
     )
+    # start.sh deliberately clears a `.env` ABLIT after sourcing it; only a
+    # caller export opts back in (see the test below).
+    keys = [key for key in keys if key not in DOTENV_CLEARED_KEYS]
     keys.append("FUTURE_LAUNCHER_KNOB")
     dotenv = "".join(f"{key}=dotenv\n" for key in keys)
     child_probe = 'printf "[%s]\\n" ' + " ".join(
@@ -175,7 +228,47 @@ def test_shell_assignments_preserve_caller_values() -> None:
     )
 
 
+def test_ablit_env_value_is_cleared_unless_the_caller_exported_it() -> None:
+    """A `.env` ABLIT never opts in; an exported one always wins.
+
+    start.sh forces ``ABLIT=0`` immediately after sourcing ``.env`` and then
+    restores the caller's exports, which is exactly what makes the documented
+    ``ABLIT=1 ./start.sh`` work while a stale ``.env`` ABLIT=1 does not.
+    """
+    probe = '\nprintf "ABLIT=[%s]\\n" "${ABLIT-unset}"\n'
+
+    # Caller silent: the .env opt-in is cleared.
+    assert _run_preamble("ABLIT=1\n", {}, probe) == "ABLIT=[0]"
+    # Documented caller opt-in survives, whatever .env says.
+    assert _run_preamble("ABLIT=1\n", {"ABLIT": "1"}, probe) == "ABLIT=[1]"
+    assert _run_preamble("ABLIT=0\n", {"ABLIT": "1"}, probe) == "ABLIT=[1]"
+    # A caller 0 turns it off even when .env opted in.
+    assert _run_preamble("ABLIT=1\n", {"ABLIT": "0"}, probe) == "ABLIT=[0]"
+
+
+def _run_preamble_stderr(env_file: str, caller: dict[str, str]) -> str:
+    """Stderr of the preamble run with no probe appended."""
+    return _run_preamble_proc(env_file, caller, "\n").stderr
+
+
+def test_ambient_override_of_model_affecting_key_is_announced() -> None:
+    """#168: an inherited env value that displaces .env for a model-affecting key is
+    named on stderr, with both values. Silent when nothing diverges."""
+    dotenv = "HF_HOME=/from/dotenv\nMODEL=from/dotenv\nMAX_NUM_SEQS=2\n"
+    err = _run_preamble_stderr(dotenv, {"HF_HOME": "/from/ambient"})
+    assert "NOTE: HF_HOME=/from/ambient from the environment overrides .env value /from/dotenv" in err
+    assert err.count("NOTE:") == 1
+    # ambient value equal to .env: nothing to report
+    assert "NOTE:" not in _run_preamble_stderr(dotenv, {"HF_HOME": "/from/dotenv"})
+    # clean environment: nothing to report
+    assert "NOTE:" not in _run_preamble_stderr(dotenv, {})
+    # an unwatched key still wins (PR #161) and is not announced
+    assert "NOTE:" not in _run_preamble_stderr(dotenv, {"MAX_NUM_SEQS": "4"})
+
+
 if __name__ == "__main__":
+    test_ambient_override_of_model_affecting_key_is_announced()
+    test_ablit_env_value_is_cleared_unless_the_caller_exported_it()
     test_every_env_example_key_preserves_caller_setness()
     test_shell_assignments_preserve_caller_values()
     test_max_num_seqs_inline_override_wins()

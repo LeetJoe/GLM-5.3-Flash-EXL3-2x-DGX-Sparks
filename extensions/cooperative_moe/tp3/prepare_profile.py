@@ -8,7 +8,10 @@ from pathlib import Path
 
 from manifest import verify_artifacts
 
-STOCK_SHA = "fe07cf3cd1928d0a189e793579a7d2dd529f75617a55f620ee14a0a9d3b20121"
+# Dense EXL3 leaves the cooperative routed-expert ABI, pointer tables and
+# TP3 Marlin exclusions unchanged. This pin supports the ordinary TP3 pack;
+# dense EXL3 still refuses TP3 trellis/head padding.
+STOCK_SHA = "da7dd6540d402f53d8a1af0f17eac5570ec37041bd2e1029017bea4ed44f87e4"
 
 
 def prepare(stock, bundle):
